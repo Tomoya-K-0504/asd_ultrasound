@@ -6,21 +6,6 @@ import librosa
 from tqdm import tqdm
 
 
-def split_audio(audio, sr, audio_length=30, length=10, overlap=5):
-    segments = []
-    one_section = sr * length
-    n_loop = (audio_length - length) // overlap + 2
-    for i in range(n_loop):
-        start_index = i * overlap * sr
-        segments.append(audio[start_index:start_index + one_section].copy())
-
-    # For audios over 30 sec
-    segments[-2] = np.hstack((segments[-2], segments[-1][overlap * sr:]))
-    segments.pop(-1)
-
-    return segments
-
-
 def cut_pad_wave(wave, sr, one_audio_sec):
     const_length = sr * one_audio_sec
     if wave.shape[0] > const_length:

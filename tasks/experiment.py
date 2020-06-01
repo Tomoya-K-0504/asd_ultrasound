@@ -18,31 +18,18 @@ from ml.src.dataset import CSVDataSet
 from ml.tasks.base_experiment import typical_train, base_expt_args, typical_experiment
 from preprocess import preprocess
 from scipy.stats import stats
+from ml.utils.notify_slack import notify_slack
+from ml.utils.utils import dump_dict
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix
-
-AVAILABLE_TARGET = ['da', 'dr']
-# CHOICES = list(itertools.combinations(list(FEATURE_COLUMNS.keys()), r)) for r in range(len(FEATURE_COLUMNS.keys()))]
-# FEATURE_PATTERNS = []
-# np.array(FEATURE_COLUMNS.keys())[list(choice)] for choice in
-# [FEATURE_PATTERNS.extend(list())]
-FEATURE_PATTERNS = ['env1_zcm5_pim5']
-DATA_KIND = ['daily', 'simulator']
 
 
 def expt_args(parser):
     parser = base_expt_args(parser)
-    expt_parser = parser.add_argument_group("Elderly Experiment arguments")
-    expt_parser.add_argument('--target', default='dr', choices=AVAILABLE_TARGET)
-    expt_parser.add_argument('--feature', default='env')
+    expt_parser = parser.add_argument_group("DCASE2020 Experiment arguments")
     expt_parser.add_argument('--n-parallel', default=1, type=int)
-    expt_parser.add_argument('--train-data-kind', default='daily', choices=DATA_KIND)
-    expt_parser.add_argument('--test-data-kind', default='daily', choices=DATA_KIND)
-    expt_parser.add_argument('--drop-day-edge', action='store_true')
-    expt_parser.add_argument('--n-test-users', default=2, type=int)
-    expt_parser.add_argument('--hyperparameters', default='')
-    expt_parser.add_argument('--expt-type', default='stat')
+    expt_parser.add_argument('--only-test', action='store_true')
     expt_parser.add_argument('--mlflow', action='store_true')
-
+    expt_parser.add_argument('--notify-slack', action='store_true')
 
     return parser
 
@@ -101,9 +88,42 @@ def get_cv_groups(expt_conf, test_user_ids: List[int]):
     return groups
 
 
-def dump_dict(path, dict_):
-    with open(path, 'w') as f:
-        json.dump(dict_, f, indent=4)
+def load_func(path):
+    wave = load(f'{path[0]}', sr=44100)[0]
+    assert wave.shape[0] / 44100 == 10
+    return wave[None, :]
+
+
+class LoadDataSet(ManifestWaveDataSet):
+    def __init__(self, manifest_path, data_conf, phase='train', load_func=None, transform=None, label_func=None):
+        super(LoadDataSet, self).__init__(manifest_path, data_conf, phase, load_func, transform, label_func)
+
+    def __getitem__(self, idx):
+        try:
+            path = Path(self.path_df.iloc[idx, 0])
+            x = torch.load(str(path.parents[2] / 'processed' / path.name.replace('.wav', '.pt')))
+        except FileNotFoundError as e:
+            print(e)
+            return super().__getitem__(idx)
+        # print(x.size())
+        label = self.labels[idx]
+
+        return x, label
+
+
+def parallel_logmel(expt_conf, load_func, label_func, phases):
+    def parallel_preprocess(dataset, idx):
+        processed, _ = dataset[idx]
+        path = Path(dataset.path_df.iloc[idx, 0])
+        torch.save(processed.to('cpu'), str(path.parents[2] / 'processed' / path.name.replace('.wav', '.pt')))
+
+    for phase in tqdm(phases):
+        process_func = Preprocessor(expt_conf, phase).preprocess
+        dataset = ManifestWaveDataSet(expt_conf[f'{phase}_path'], expt_conf, phase, load_func, process_func,
+                                      label_func)
+        Parallel(n_jobs=8, verbose=0)(
+            [delayed(parallel_preprocess)(dataset, idx) for idx in range(len(dataset))])
+        print(f'{phase} done')
 
 
 def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids):
@@ -114,17 +134,15 @@ def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids
                         filename=expt_dir / 'expt.log')
 
     expt_conf['class_names'] = [0, 1]
-    if expt_conf['train_manager'] == 'nn':
-        metrics_names = {'train': ['loss', 'uar'],
-                         'val': ['loss', 'uar'],
-                         'test': ['loss', 'uar']}
-    else:
-        metrics_names = {'train': ['uar'],
-                         'val': ['uar'],
-                         'test': ['uar']}
+    metrics_names = {'train': ['loss', 'uar'],
+                     'val': ['loss', 'uar'],
+                     'test': ['loss', 'uar']}
 
-    dataset_cls = CSVDataSet
+    expt_conf['sample_rate'] = 44100
+
     expt_conf = set_data_paths(expt_dir, expt_conf, test_user_ids)
+    dataset_cls = LoadDataSet
+    load_func = set_load_func(expt_conf['sample_rate'], expt_conf['n_waves'])
 
     patterns = list(itertools.product(*hyperparameters.values()))
     val_results = pd.DataFrame(np.zeros((len(patterns), len(hyperparameters) + len(metrics_names['val']))),
@@ -205,12 +223,6 @@ def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids
         with open(expt_dir.parent / result_file_name, 'a') as f:
             f.write(f"{expt_conf['n_splits']},{expt_conf['feature']},{val_results['uar'].max()},{uar}\n")
 
-        # features = []
-        # [features.extend(FEATURE_COLUMNS[feature]) for feature in expt_conf['feature'].split('_')]
-        # print(getattr(experimentor.train_manager_cls, 'model_manager'))
-        # importances = experimentor.train_manager_cls.model_manager.model.get_feature_importances(features)
-        # importances.to_csv(expt_dir / 'feature_importances.csv', index=False)
-
     mlflow.end_run()
 
 
@@ -258,17 +270,28 @@ if __name__ == '__main__':
         }
     else:
         hyperparameters = {
-            'lr': [0.01],
+            'lr': [5e-5],
+            'batch_size': [2],
+            'model_type': ['panns'],
+            'transform': ['logmel'],
+            'loss_func': ['ce'],
+            'checkpoint_path': ['../Cnn14.pth'],
+            'window_size': [0.05],
+            'window_stride': [0.002],
+            'n_waves': [1],
+            'epoch_rate': [1.0],
+            'mixup_alpha': [0.0],
+            'sample_balance': ['same'],
+            'time_drop_rate': [0.0],
+            'freq_drop_rate': [0.0]
         }
-    dump_dict(f"{expt_conf['model_type']}.txt", hyperparameters)
 
-    tmp_dir = Path(__file__).resolve().parents[1] / 'daily'
     test_users = [csv.name.replace('_life_dms.csv', '') for csv in Path(tmp_dir).iterdir() if csv.name.startswith('p')]
     # np.random.shuffle(test_users)
     test_users.sort()
     test_user_id_patterns = np.array(test_users).reshape((-1, expt_conf['n_test_users']))
 
-    test_folder_name = f"ntest-{expt_conf['n_test_users']}_{expt_conf['expt_type']}"
+    # test_folder_name = f"ntest-{expt_conf['n_test_users']}_{expt_conf['expt_type']}"
 
     for test_user_id_pattern in test_user_id_patterns:
         expt_conf['expt_id'] = f"{expt_conf['expt_type']}_{expt_conf['model_type']}_{expt_conf['target']}_test-{expt_conf['test_data_kind']}_{expt_conf['feature']}"
@@ -278,9 +301,17 @@ if __name__ == '__main__':
         main(expt_conf, expt_dir, hyperparameters, typical_train, test_user_id_pattern)
         # break
 
-    aggregate(expt_conf)
+    # aggregate(expt_conf)
 
     if not expt_conf['mlflow']:
         import shutil
 
         shutil.rmtree('mlruns')
+
+    if expt_conf['notify_slack']:
+        cfg = dict(
+            body=f"Finished experiment {expt_conf['expt_id']}: \n" +
+                 "Notion ticket: https://www.notion.so/DCASE-2020-010ca4ceda0f49828d2ee81b77b8e1a4",
+            webhook_url='https://hooks.slack.com/services/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'
+        )
+        notify_slack(cfg)

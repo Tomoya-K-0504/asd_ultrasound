@@ -21,12 +21,15 @@ if __name__ == '__main__':
     plt.savefig('sth.png')
 
     wav_dir = Path('../input/USV_Data')
+    processed_dir = Path('../input/processed')
     output_path = Path('../output') / 'stft'
     output_path.mkdir(exist_ok=True, parents=True)
+    processed_dir.mkdir(exist_ok=True, parents=True)
     sr = 300000
     for wav_path in tqdm(sorted(list(wav_dir.iterdir()))):
         wav, _ = librosa.load(str(wav_path), sr=sr)
         f, t, Zxx = scipy.signal.stft(wave, fs=sr, nperseg=sr)
+        np.save(processed_dir / f'{wav_path.name}.npy', np.abs(Zxx))
         plt.pcolormesh(t, f, np.abs(Zxx))
         plt.title('STFT Magnitude')
         plt.ylabel('Frequency [Hz]')
