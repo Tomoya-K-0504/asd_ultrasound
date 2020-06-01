@@ -12,123 +12,63 @@ from typing import List
 import mlflow
 import numpy as np
 import pandas as pd
-from aggregate import aggregate
 from joblib import Parallel, delayed
-from ml.src.dataset import CSVDataSet
+from ml.src.dataset import ManifestWaveDataSet
 from ml.tasks.base_experiment import typical_train, base_expt_args, typical_experiment
-from preprocess import preprocess
 from scipy.stats import stats
 from ml.utils.notify_slack import notify_slack
 from ml.utils.utils import dump_dict
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix
 
+LABEL2INT = {'pat': 1, 'WT': 0}
+
 
 def expt_args(parser):
     parser = base_expt_args(parser)
-    expt_parser = parser.add_argument_group("DCASE2020 Experiment arguments")
+    expt_parser = parser.add_argument_group("ASD ultrasound Experiment arguments")
     expt_parser.add_argument('--n-parallel', default=1, type=int)
-    expt_parser.add_argument('--only-test', action='store_true')
     expt_parser.add_argument('--mlflow', action='store_true')
     expt_parser.add_argument('--notify-slack', action='store_true')
 
     return parser
 
 
-def label_func(row):
-    return row.values[-1]
+def label_func(path):
+    return LABEL2INT[path[1]]
 
 
 def load_func(path):
-    df = pd.read_csv(path, header=None).values
-    return df[:, :-1], df[:, -1]
+    return np.load(path[0])
 
 
-def set_process_func(model_type, mean_, std_):
-    def z_score(x):
-        return (x - mean_) / std_
+def set_data_paths(expt_conf):
+    data_dir = Path(__file__).resolve().parents[1] / 'input' / 'processed'
+    label_df = pd.read_excel(data_dir.parent / 'P08_12_USV_15qDup_MouseInfo.xlsx')
+    manifest_df = pd.read_csv(data_dir.parent / 'manifest.csv')
+    label_df['label'] = label_df['Genotype'].apply(lambda x: LABEL2INT[x])
+    label_df['group'] = 0
 
-    def no_process(x):
-        return x
+    for label in LABEL2INT.values():
+        n_subjects = label_df[label_df['label'] == label].shape[0]
+        label_df[label_df['label'] == label, 'group'] = [j % expt_conf['n_splits'] for j in range(n_subjects)]
 
-    if model_type in ['nn', 'svm', 'knn']:
-        return z_score
-    else:
-        return no_process
+    manifest_df['mouse_id'] = manifest_df['file_path'].apply(lambda x: x.split('_')[1])
+    groups = manifest_df.merge(right=label_df, how='left', left_on='mouse_id', right_on='MouseID')['group']
 
-
-def set_data_paths(expt_dir, expt_conf, test_user_ids) -> Dict:
-    data_dir = Path(__file__).resolve().parents[1]
-    data_df = preprocess(data_dir, expt_conf['train_data_kind'], expt_conf['target'], expt_conf['feature'],
-                         expt_conf['drop_day_edge'])
-    train_data_df = data_df[~data_df['sub_id'].isin(test_user_ids)].drop('sub_id', axis=1)
+    manifest_df = manifest_df.drop('mouse_id', axis=1)
     # This split rate has no effect if you specify group k-fold. Train and val set will be combined on CV
-    train_data_df.iloc[:int(len(train_data_df) // 2)].to_csv(expt_dir / 'train_data.csv', index=False, header=None)
-    train_data_df.iloc[int(len(train_data_df) // 2):].to_csv(expt_dir / 'val_data.csv', index=False, header=None)
-    expt_conf['train_path'] = str(expt_dir / 'train_data.csv')
-    expt_conf['val_path'] = str(expt_dir / 'val_data.csv')
-
-    data_df = preprocess(data_dir, expt_conf['test_data_kind'], expt_conf['target'], expt_conf['feature'],
-                         expt_conf['drop_day_edge'])
-    test_df = data_df[data_df['sub_id'].isin(test_user_ids)].drop('sub_id', axis=1)
-    test_df.to_csv(expt_dir / 'test_data.csv', index=False, header=None)
-    expt_conf['test_path'] = str(expt_dir / 'test_data.csv')
-
-    return expt_conf
+    manifest_df.iloc[:int(len(manifest_df) // 2)].to_csv(data_dir / 'train_data.csv', index=False, header=None)
+    manifest_df.iloc[int(len(manifest_df) // 2):].to_csv(data_dir / 'val_data.csv', index=False, header=None)
+    expt_conf['train_path'] = str(data_dir / 'train_data.csv')
+    expt_conf['val_path'] = str(data_dir / 'val_data.csv')
+    
+    return expt_conf, groups
 
 
-def get_cv_groups(expt_conf, test_user_ids: List[int]):
-    data_dir = Path(__file__).resolve().parents[1]
-    data_df = preprocess(data_dir, expt_conf['train_data_kind'], expt_conf['target'], expt_conf['feature'], expt_conf['drop_day_edge'])
-    data_df = data_df[~data_df['sub_id'].isin(test_user_ids)]
-
-    subjects = data_df[['sub_id']].drop_duplicates()
-    subjects['group'] = [j % expt_conf['n_splits'] for j in range(len(subjects))]
-    subjects = subjects.set_index('sub_id')
-    groups = data_df['sub_id'].apply(lambda x: subjects.loc[x, 'group'])
-    return groups
-
-
-def load_func(path):
-    wave = load(f'{path[0]}', sr=44100)[0]
-    assert wave.shape[0] / 44100 == 10
-    return wave[None, :]
-
-
-class LoadDataSet(ManifestWaveDataSet):
-    def __init__(self, manifest_path, data_conf, phase='train', load_func=None, transform=None, label_func=None):
-        super(LoadDataSet, self).__init__(manifest_path, data_conf, phase, load_func, transform, label_func)
-
-    def __getitem__(self, idx):
-        try:
-            path = Path(self.path_df.iloc[idx, 0])
-            x = torch.load(str(path.parents[2] / 'processed' / path.name.replace('.wav', '.pt')))
-        except FileNotFoundError as e:
-            print(e)
-            return super().__getitem__(idx)
-        # print(x.size())
-        label = self.labels[idx]
-
-        return x, label
-
-
-def parallel_logmel(expt_conf, load_func, label_func, phases):
-    def parallel_preprocess(dataset, idx):
-        processed, _ = dataset[idx]
-        path = Path(dataset.path_df.iloc[idx, 0])
-        torch.save(processed.to('cpu'), str(path.parents[2] / 'processed' / path.name.replace('.wav', '.pt')))
-
-    for phase in tqdm(phases):
-        process_func = Preprocessor(expt_conf, phase).preprocess
-        dataset = ManifestWaveDataSet(expt_conf[f'{phase}_path'], expt_conf, phase, load_func, process_func,
-                                      label_func)
-        Parallel(n_jobs=8, verbose=0)(
-            [delayed(parallel_preprocess)(dataset, idx) for idx in range(len(dataset))])
-        print(f'{phase} done')
-
-
-def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids):
+def main(expt_conf, hyperparameters, typical_train_func):
     if expt_conf['expt_id'] == 'timestamp':
         expt_conf['expt_id'] = dt.today().strftime('%Y-%m-%d_%H:%M')
+    expt_dir = Path(__file__).resolve().parents[1] / 'output' / expt_conf['expt_id']
 
     logging.basicConfig(level=logging.DEBUG, format="[%(name)s] [%(levelname)s] %(message)s",
                         filename=expt_dir / 'expt.log')
@@ -140,18 +80,16 @@ def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids
 
     expt_conf['sample_rate'] = 44100
 
-    expt_conf = set_data_paths(expt_dir, expt_conf, test_user_ids)
-    dataset_cls = LoadDataSet
-    load_func = set_load_func(expt_conf['sample_rate'], expt_conf['n_waves'])
+    expt_conf, groups = set_data_paths(expt_conf)
 
     patterns = list(itertools.product(*hyperparameters.values()))
     val_results = pd.DataFrame(np.zeros((len(patterns), len(hyperparameters) + len(metrics_names['val']))),
                                columns=list(hyperparameters.keys()) + metrics_names['val'])
+    dataset_cls = ManifestWaveDataSet
+    process_func = None
 
     pp = pprint.PrettyPrinter(indent=4)
     pp.pprint(hyperparameters)
-
-    groups = get_cv_groups(expt_conf, test_user_ids)
 
     def experiment(pattern, expt_conf):
         for i, param in enumerate(hyperparameters.keys()):
@@ -159,9 +97,6 @@ def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids
 
         expt_conf['model_path'] = str(expt_dir / f"{'_'.join([str(p).replace('/', '-') for p in pattern])}.pth")
         expt_conf['log_id'] = f"{'_'.join([str(p).replace('/', '-') for p in pattern])}"
-        # TODO cv時はmean と stdをtrainとvalの分割後に求める必要がある
-        train_df = pd.read_csv(expt_conf['train_path']).iloc[:, :-1]
-        process_func = set_process_func(expt_conf['model_type'], train_df.mean().values, train_df.std().values)
 
         with mlflow.start_run():
             result_series, val_pred, _ = typical_train_func(expt_conf, load_func, label_func, process_func, dataset_cls,
@@ -202,7 +137,6 @@ def main(expt_conf, expt_dir, hyperparameters, typical_train_func, test_user_ids
         dump_dict(expt_dir / 'best_parameters.txt', {p: v for p, v in zip(hyperparameters.keys(), best_pattern)})
 
         train_df = pd.read_csv(expt_conf['train_path']).iloc[:, :-1]
-        process_func = set_process_func(expt_conf['model_type'], train_df.mean().values, train_df.std().values)
 
         metrics, pred_dict_list, experimentor = typical_experiment(expt_conf, load_func, label_func, process_func,
                                                                    dataset_cls, groups)
@@ -235,73 +169,16 @@ if __name__ == '__main__':
     console.setLevel(logging.DEBUG)
     logging.getLogger("ml").addHandler(console)
 
-    if expt_conf['hyperparameters']:
-        with open(f"{expt_conf['hyperparameters']}.txt", 'r') as f:
-            hyperparameters = json.load(f)
-    elif 'nn' in expt_conf['model_type'] and expt_conf['model_type'] != 'knn':
-        hyperparameters = {
-            'lr': [0.001, 0.0001],
-            'nn_hidden_nodes': [[50], [50, 50], [50, 50, 50]],
-            'sample_balance': ['same'],
-        }
-    elif expt_conf['model_type'] == 'lightgbm':
-        hyperparameters = {
-            'lr': [0.001, 0.0001],
-            'n_leaves': [6, 16],
-            'min_data_in_leaf': [50, 100],
-            'max_depth': [3, 6],
-            'n_estimators': [200],
-            'subsample': [0.7],
-            'feature_fraction': [0.7],
-            'max_bin': [100],
-            'reg_alpha': [1.0],
-            'reg_lambda': [1.0],
-        }
-    elif expt_conf['model_type'] == 'rf':
-        hyperparameters = {
-            'max_depth': [3, 6],
-            'n_estimators': [50, 200],
-            'subsample': [0.6, 0.9],
-        }
-    elif expt_conf['model_type'] == 'svm':
-        hyperparameters = {
-            'C': [0.001, 0.01, 0.1, 1.0],
-            'class_weight': ['balanced'],
-        }
-    else:
-        hyperparameters = {
-            'lr': [5e-5],
-            'batch_size': [2],
-            'model_type': ['panns'],
-            'transform': ['logmel'],
-            'loss_func': ['ce'],
-            'checkpoint_path': ['../Cnn14.pth'],
-            'window_size': [0.05],
-            'window_stride': [0.002],
-            'n_waves': [1],
-            'epoch_rate': [1.0],
-            'mixup_alpha': [0.0],
-            'sample_balance': ['same'],
-            'time_drop_rate': [0.0],
-            'freq_drop_rate': [0.0]
-        }
+    hyperparameters = {
+        'lr': [1e-4],
+        'batch_size': [2],
+        'model_type': ['panns'],
+        'checkpoint_path': ['../Cnn14.pth'],
+        'epoch_rate': [1.0],
+        'sample_balance': ['same'],
+    }
 
-    test_users = [csv.name.replace('_life_dms.csv', '') for csv in Path(tmp_dir).iterdir() if csv.name.startswith('p')]
-    # np.random.shuffle(test_users)
-    test_users.sort()
-    test_user_id_patterns = np.array(test_users).reshape((-1, expt_conf['n_test_users']))
-
-    # test_folder_name = f"ntest-{expt_conf['n_test_users']}_{expt_conf['expt_type']}"
-
-    for test_user_id_pattern in test_user_id_patterns:
-        expt_conf['expt_id'] = f"{expt_conf['expt_type']}_{expt_conf['model_type']}_{expt_conf['target']}_test-{expt_conf['test_data_kind']}_{expt_conf['feature']}"
-        pj_dir = Path(__file__).resolve().parents[1]
-        expt_dir = pj_dir / 'output' / test_folder_name / '_'.join(test_user_id_pattern) / f"{expt_conf['expt_id']}"
-        expt_dir.mkdir(exist_ok=True, parents=True)
-        main(expt_conf, expt_dir, hyperparameters, typical_train, test_user_id_pattern)
-        # break
-
-    # aggregate(expt_conf)
+    main(expt_conf, hyperparameters, typical_train)
 
     if not expt_conf['mlflow']:
         import shutil
